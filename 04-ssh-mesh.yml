@@ -1,0 +1,216 @@
+---
+# Full-mesh SSH test: every node -> every other node. Read-only on the Macs
+# (no known_hosts / authorized_keys written; temp askpass helper removed after).
+#
+# Layers per pair:
+#   tcp : port 22 reachable (nc)
+#   key : passwordless / key auth (ssh BatchMode)
+#   pw  : password auth via SSH_ASKPASS (OpenSSH >= 8.4; no sshpass/admin needed)
+#
+# Output (controller):
+#   reports/ssh-mesh.csv   one row per src->dst pair
+#   console summary        failures + asymmetric pairs (A->B ok, B->A not)
+#
+# Usage:
+#   ansible-playbook 04-ssh-mesh.yml --ask-vault-pass
+#   ansible-playbook 04-ssh-mesh.yml --ask-vault-pass -e target=coding_tier
+#   ansible-playbook 04-ssh-mesh.yml --ask-vault-pass -e '{"mesh_require":["tcp","key"]}'
+
+- name: Hydra | SSH mesh test
+  hosts: "{{ target | default('hydra') }}"
+  gather_facts: false
+
+  vars:
+    mesh_test_key: true
+    mesh_test_password: true
+    mesh_require: [tcp, pw]          # layers that count as FAIL in the summary
+    mesh_connect_timeout: 5
+    mesh_report: "{{ playbook_dir }}/reports/ssh-mesh.csv"
+    askpass_path: "/tmp/.hydra_askpass_{{ ansible_user }}"
+    # Destinations = every host in the play except self.
+    # Set mesh_ip per host in inventory if the ring/10GbE network differs from the mgmt IP.
+    mesh_peers: "{{ ansible_play_hosts_all | difference([inventory_hostname]) }}"
+
+  tasks:
+    - name: OpenSSH client version
+      ansible.builtin.command: ssh -V
+      register: sshv
+      changed_when: false
+
+    - name: Password test supported? (SSH_ASKPASS_REQUIRE needs OpenSSH >= 8.4)
+      ansible.builtin.set_fact:
+        pw_supported: >-
+          {{ (sshv.stderr | regex_search('OpenSSH_(\d+\.\d+)', '\1') | default(['0.0'], true) | first)
+             is version('8.4', '>=') }}
+
+    - name: Probe peers
+      block:
+        - name: Install temp askpass helper
+          when: mesh_test_password | bool and pw_supported | bool
+          ansible.builtin.copy:
+            dest: "{{ askpass_path }}"
+            mode: "0700"
+            content: |
+              #!/bin/sh
+              printf '%s\n' "$HYDRA_PEER_PW"
+
+        - name: SSH to each peer
+          ansible.builtin.shell: |
+            T="{{ hostvars[item].mesh_ip | default(hostvars[item].ansible_host | default(item)) }}"
+            U="{{ hostvars[item].ansible_user }}"
+            O="-o ConnectTimeout={{ mesh_connect_timeout }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+            c() {
+              case "$1" in
+                *"Permission denied"*) echo denied ;;
+                *"onnection closed"*|*"closed by remote"*|*"reset by peer"*) echo closed ;;
+                *refused*) echo refused ;;
+                *"timed out"*) echo timeout ;;
+                *"No route"*|*"unreachable"*) echo noroute ;;
+                *"Host key verification"*) echo hostkey ;;
+                *) echo err ;;
+              esac
+            }
+            echo "ip=$T"
+
+            # 1. TCP
+            if ! nc -z -G {{ mesh_connect_timeout }} "$T" 22 >/dev/null 2>&1; then
+              echo "tcp=fail"; echo "key=skip"; echo "pw=skip"; exit 0
+            fi
+            echo "tcp=ok"
+
+            # 2. Key / passwordless
+            {% if mesh_test_key | bool %}
+            if OUT=$(ssh $O -o BatchMode=yes "$U@$T" hostname 2>&1 </dev/null); then
+              echo "key=ok"; echo "rhost=$OUT"
+            else
+              echo "key=$(c "$OUT")"; echo "err=key: $(echo "$OUT" | tr -d "\r" | tail -1)"
+            fi
+            {% else %}
+            echo "key=skip"
+            {% endif %}
+
+            # 3. Password
+            {% if mesh_test_password | bool and pw_supported | bool %}
+            if OUT=$(SSH_ASKPASS="{{ askpass_path }}" SSH_ASKPASS_REQUIRE=force DISPLAY=none \
+                     ssh $O -o PubkeyAuthentication=no \
+                         -o PreferredAuthentications=keyboard-interactive,password \
+                         -o NumberOfPasswordPrompts=1 "$U@$T" hostname 2>&1 </dev/null); then
+              echo "pw=ok"; echo "rhost=$OUT"
+            else
+              echo "pw=$(c "$OUT")"; echo "err=pw: $(echo "$OUT" | tr -d "\r" | tail -1)"
+            fi
+            {% elif mesh_test_password | bool %}
+            echo "pw=unsupported"
+            {% else %}
+            echo "pw=skip"
+            {% endif %}
+          environment:
+            HYDRA_PEER_PW: "{{ hostvars[item].ansible_password | default('') if mesh_test_password | bool else '' }}"
+          loop: "{{ mesh_peers }}"
+          loop_control:
+            label: "{{ inventory_hostname }} -> {{ item }}"
+          register: probe
+          changed_when: false
+          failed_when: false
+
+      always:
+        - name: Remove askpass helper
+          ansible.builtin.file:
+            path: "{{ askpass_path }}"
+            state: absent
+
+    - name: Parse results
+      ansible.builtin.set_fact:
+        mesh: >-
+          {{ mesh | default({}) | combine({ item.item: {
+               'ip':    item.stdout | default('') | regex_search('ip=(\S+)', '\1') | default(['-'], true) | first,
+               'tcp':   item.stdout | default('') | regex_search('tcp=(\S+)', '\1') | default(['err'], true) | first,
+               'key':   item.stdout | default('') | regex_search('key=(\S+)', '\1') | default(['err'], true) | first,
+               'pw':    item.stdout | default('') | regex_search('pw=(\S+)', '\1') | default(['err'], true) | first,
+               'rhost': item.stdout | default('') | regex_search('rhost=(\S+)', '\1') | default([''], true) | first,
+               'err':   (item.stdout | default('') | regex_findall('err=(.*)') | join(' | ')) or (item.stderr | default(''))
+             } }) }}
+      loop: "{{ probe.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ---------------- Controller-side aggregation ----------------
+    - name: Flatten pairs
+      run_once: true
+      ansible.builtin.set_fact:
+        mesh_rows_json: >-
+          {% set ns = namespace(rows=[]) %}
+          {% for s in ansible_play_hosts %}
+          {% for d, r in (hostvars[s].mesh | default({})) | dictsort %}
+          {% set ns.rows = ns.rows + [{'src': s, 'dst': d} | combine(r)] %}
+          {% endfor %}
+          {% endfor %}
+          {{ ns.rows | to_json }}
+
+    - name: Parse pairs
+      run_once: true
+      ansible.builtin.set_fact:
+        mesh_rows: "{{ mesh_rows_json | trim | from_json }}"
+
+    - name: Classify failures + asymmetry
+      run_once: true
+      ansible.builtin.set_fact:
+        mesh_fail_json: >-
+          {% set ns = namespace(out=[]) %}
+          {% for r in mesh_rows %}
+          {% set failed = [] %}
+          {% for l in mesh_require %}{% if r[l] != 'ok' %}{% set _ = failed.append(l ~ '=' ~ r[l]) %}{% endif %}{% endfor %}
+          {% if failed %}{% set ns.out = ns.out + [r.src ~ ' -> ' ~ r.dst ~ ' (' ~ r.ip ~ '): ' ~ failed | join(', ')] %}{% endif %}
+          {% endfor %}
+          {{ ns.out | to_json }}
+        mesh_asym_json: >-
+          {% set ns = namespace(out=[]) %}
+          {% for r in mesh_rows %}
+          {% set rev = (hostvars[r.dst].mesh | default({}))[r.src] | default(none) %}
+          {% for l in ['key', 'pw'] %}
+          {% if rev and r[l] == 'ok' and rev[l] not in ['ok', 'skip', 'unsupported'] %}
+          {% set ns.out = ns.out + [l ~ ': ' ~ r.src ~ ' -> ' ~ r.dst ~ ' ok, reverse = ' ~ rev[l]] %}
+          {% endif %}
+          {% endfor %}
+          {% endfor %}
+          {{ ns.out | to_json }}
+
+    - name: Parse classification
+      run_once: true
+      ansible.builtin.set_fact:
+        mesh_fail: "{{ mesh_fail_json | trim | from_json }}"
+        mesh_asym: "{{ mesh_asym_json | trim | from_json }}"
+
+    - name: Write CSV
+      run_once: true
+      delegate_to: localhost
+      block:
+        - name: Ensure reports dir
+          ansible.builtin.file:
+            path: "{{ mesh_report | dirname }}"
+            state: directory
+            mode: "0755"
+
+        - name: Write ssh-mesh.csv
+          ansible.builtin.copy:
+            dest: "{{ mesh_report }}"
+            mode: "0644"
+            content: |
+              src,dst,dst_ip,tcp,key,pw,remote_hostname,error
+              {% for r in mesh_rows %}
+              {{ r.src }},{{ r.dst }},{{ r.ip }},{{ r.tcp }},{{ r.key }},{{ r.pw }},{{ r.rhost }},"{{ r.err | replace('"', "'") | replace('\n', ' ') | replace('\r', '') }}"
+              {% endfor %}
+
+    - name: Summary
+      run_once: true
+      ansible.builtin.debug:
+        msg:
+          sources_tested: "{{ ansible_play_hosts | length }}/{{ ansible_play_hosts_all | length }} (unreachable from controller: {{ ansible_play_hosts_all | difference(ansible_play_hosts) }})"
+          pairs: "{{ mesh_rows | length }}"
+          tcp_ok: "{{ mesh_rows | selectattr('tcp', 'eq', 'ok') | list | length }}"
+          key_ok: "{{ mesh_rows | selectattr('key', 'eq', 'ok') | list | length }}"
+          pw_ok: "{{ mesh_rows | selectattr('pw', 'eq', 'ok') | list | length }}"
+          required: "{{ mesh_require }}"
+          failures: "{{ mesh_fail }}"
+          asymmetric: "{{ mesh_asym }}"
+          report: "{{ mesh_report }}"

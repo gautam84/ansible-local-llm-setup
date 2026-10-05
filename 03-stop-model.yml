@@ -1,0 +1,15 @@
+---
+- name: Hydra | Stop model server
+  hosts: "{{ target | default('hydra') }}"
+  gather_facts: false
+  vars:
+    pid_file: "{{ hydra_run_dir }}/{{ model_name }}.pid"
+  tasks:
+    - name: Kill via pidfile
+      ansible.builtin.shell: |
+        [ -f "{{ pid_file }}" ] || exit 0
+        PID=$(cat "{{ pid_file }}")
+        kill "$PID" 2>/dev/null; sleep 5; kill -9 "$PID" 2>/dev/null
+        rm -f "{{ pid_file }}"; echo stopped
+      register: s
+      changed_when: "'stopped' in s.stdout"

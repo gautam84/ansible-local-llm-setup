@@ -1,0 +1,244 @@
+---
+# Download model from Kaggle -> (optional) quantize -> start OpenAI-compatible server.
+# Idempotent: skips download if marker exists; restarts server each run.
+- name: Hydra | Kaggle model download + serve
+  hosts: "{{ target | default('inference') }}"
+  gather_facts: true
+  gather_subset: [hardware]
+
+  vars:
+    model_dir: "{{ hydra_models_dir }}/{{ model_name }}"
+    model_marker: "{{ model_dir }}/.kaggle_download_ok"
+    archive_path: "{{ hydra_root }}/tmp/{{ model_name }}.tar.gz"
+    kaggle_url: "https://www.kaggle.com/api/v1/models/{{ kaggle_model_handle }}/download"
+    quant_dir: "{{ hydra_models_dir }}/{{ model_name }}-mlx-q{{ model_q_bits }}"
+    pid_file: "{{ hydra_run_dir }}/{{ model_name }}.pid"
+    log_file: "{{ hydra_logs_dir }}/{{ model_name }}.log"
+    server_env: "{{ proxy_env | combine({'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'}) }}"
+
+  pre_tasks:
+    - name: Guard — config filled in
+      ansible.builtin.assert:
+        that:
+          - "'<' not in kaggle_model_handle"
+          - kaggle_model_handle.split('/') | length == 5
+          - model_name != 'CHANGE-ME'
+        fail_msg: "Set kaggle_model_handle (owner/model/framework/variation/version) and model_name for {{ inventory_hostname }}"
+
+    - name: Check Hydra venv
+      ansible.builtin.command: "{{ hydra_venv }}/bin/python -c 'import mlx_lm; print(mlx_lm.__version__)'"
+      register: mlx_check
+      changed_when: false
+      failed_when: false
+
+    - name: Guard — venv ready
+      ansible.builtin.assert:
+        that: mlx_check.rc == 0
+        fail_msg: "mlx-lm not importable from {{ hydra_venv }} — run the node setup playbook first. {{ mlx_check.stderr | default('') }}"
+
+  tasks:
+    - name: Ensure dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ hydra_models_dir }}"
+        - "{{ hydra_logs_dir }}"
+        - "{{ hydra_run_dir }}"
+        - "{{ hydra_root }}/tmp"
+
+    - name: Check download marker
+      ansible.builtin.stat:
+        path: "{{ model_marker }}"
+      register: marker
+
+    # ---------------- Download ----------------
+    - name: Download + extract from Kaggle
+      when: not marker.stat.exists
+      block:
+        - name: Pull archive from Kaggle (curl via proxy; creds on stdin, not argv)
+          ansible.builtin.command:
+            argv: "{{ ['curl', '-fL', '--retry', '3', '--retry-delay', '10', '-C', '-',
+                       '--connect-timeout', '30', '-o', archive_path, '-K', '-']
+                      + (zscaler_ca_bundle | length > 0) | ternary(['--cacert', zscaler_ca_bundle], [])
+                      + [kaggle_url] }}"
+            stdin: 'user = "{{ kaggle_username }}:{{ kaggle_key }}"'
+          environment: "{{ proxy_env }}"
+          throttle: "{{ kaggle_download_throttle }}"
+          changed_when: true
+          no_log: "{{ not (debug_kaggle | default(false) | bool) }}"   # -e debug_kaggle=true to see curl errors
+
+        - name: Ensure model dir
+          ansible.builtin.file:
+            path: "{{ model_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Extract (bsdtar auto-detects compression)
+          ansible.builtin.command: tar -xf "{{ archive_path }}" -C "{{ model_dir }}"
+          changed_when: true
+
+        - name: Write marker
+          ansible.builtin.copy:
+            dest: "{{ model_marker }}"
+            content: "{{ kaggle_model_handle }} {{ ansible_date_time.iso8601 | default('') }}\n"
+            mode: "0644"
+
+      rescue:
+        - name: Remove partial model dir
+          ansible.builtin.file:
+            path: "{{ model_dir }}"
+            state: absent
+
+        - name: Fail with context
+          ansible.builtin.fail:
+            msg: >-
+              Kaggle download/extract failed on {{ inventory_hostname }}.
+              401/403 = creds or model license not accepted on kaggle.com;
+              timeout/SSL = proxy or Zscaler CA (set zscaler_ca_bundle).
+              Re-run with -e debug_kaggle=true for curl output.
+
+      always:
+        - name: Remove archive
+          ansible.builtin.file:
+            path: "{{ archive_path }}"
+            state: absent
+
+    # ---------------- Resolve + validate ----------------
+    - name: Locate config.json (Kaggle archives may be nested)
+      ansible.builtin.shell: set -o pipefail && find "{{ model_dir }}" -maxdepth 4 -name config.json -not -path '*/.*' | head -1
+      args:
+        executable: /bin/bash
+      register: cfg
+      changed_when: false
+
+    - name: Guard — valid HF/MLX model dir
+      ansible.builtin.assert:
+        that: cfg.stdout | length > 0
+        fail_msg: "No config.json under {{ model_dir }} — wrong framework variant? Pick the Transformers/MLX one on Kaggle."
+
+    - name: Set source path
+      ansible.builtin.set_fact:
+        model_src_path: "{{ cfg.stdout | dirname }}"
+
+    - name: Model size on disk (MB)
+      ansible.builtin.shell: set -o pipefail && du -sm "{{ model_src_path }}" | awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: model_mb
+      changed_when: false
+
+    - name: Download-only result
+      when: not (model_serve | bool)
+      ansible.builtin.debug:
+        msg:
+          model_path: "{{ model_src_path }}"
+          size_mb: "{{ model_mb.stdout }}"
+          note: "model_serve=false — downloaded only (distributed/ring tier or -e model_serve=false)"
+
+    - name: Quantize + serve
+      when: model_serve | bool
+      block:
+        - name: Guard — fits in ~75% of RAM
+          ansible.builtin.assert:
+            that: >-
+              allow_oversize_model | bool or model_quantize | bool or
+              (model_mb.stdout | int) < (ansible_memtotal_mb * 0.75)
+            fail_msg: >-
+              Model is {{ model_mb.stdout }} MB vs {{ ansible_memtotal_mb }} MB RAM.
+              Set model_quantize=true or pick a smaller variant (or allow_oversize_model=true).
+
+        # ---------------- Optional quantize ----------------
+        - name: Quantize to MLX q{{ model_q_bits }}
+          when: model_quantize | bool
+          ansible.builtin.command: >-
+            {{ hydra_venv }}/bin/python -m mlx_lm.convert
+            --hf-path {{ model_src_path }}
+            --mlx-path {{ quant_dir }}
+            -q --q-bits {{ model_q_bits }}
+          args:
+            creates: "{{ quant_dir }}/config.json"
+          environment: "{{ server_env }}"
+
+        - name: Set serve path
+          ansible.builtin.set_fact:
+            model_serve_path: "{{ (model_quantize | bool) | ternary(quant_dir, model_src_path) }}"
+
+        # ---------------- (Re)start server ----------------
+        - name: Stop previous instance (ours, via pidfile)
+          ansible.builtin.shell: |
+            if [ -f "{{ pid_file }}" ]; then
+              PID=$(cat "{{ pid_file }}")
+              kill "$PID" 2>/dev/null && sleep 5
+              kill -9 "$PID" 2>/dev/null
+              rm -f "{{ pid_file }}"
+              echo stopped
+            fi
+          register: stop_out
+          changed_when: "'stopped' in stop_out.stdout"
+
+        - name: Check port is free
+          ansible.builtin.command: lsof -nP -iTCP:{{ server_port }} -sTCP:LISTEN -t
+          register: port_owner
+          changed_when: false
+          failed_when: false
+
+        - name: Guard — port free
+          ansible.builtin.assert:
+            that: port_owner.stdout | length == 0
+            fail_msg: "Port {{ server_port }} held by PID(s) {{ port_owner.stdout_lines }} (not ours). Stop it or change server_port."
+
+        - name: Start {{ server_module }}
+          ansible.builtin.shell: |
+            nohup "{{ hydra_venv }}/bin/python" -m {{ server_module }} \
+              --model "{{ model_serve_path }}" \
+              --host {{ server_host }} --port {{ server_port }} {{ server_extra_args }} \
+              </dev/null >>"{{ log_file }}" 2>&1 &
+            echo $! > "{{ pid_file }}"
+          environment: "{{ server_env }}"
+          changed_when: true
+
+        - name: Wait for server ready
+          block:
+            - name: Poll /v1/models
+              ansible.builtin.uri:
+                url: "http://127.0.0.1:{{ server_port }}/v1/models"
+                use_proxy: false
+                status_code: 200
+              register: ready
+              until: ready.status == 200
+              retries: "{{ server_ready_retries }}"
+              delay: "{{ server_ready_delay }}"
+          rescue:
+            - name: Tail server log
+              ansible.builtin.command: tail -n 40 "{{ log_file }}"
+              register: log_tail
+              changed_when: false
+
+            - name: Fail with log
+              ansible.builtin.fail:
+                msg: "Server didn't come up on {{ inventory_hostname }}:\n{{ log_tail.stdout }}"
+
+        - name: Smoke test — chat completion
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ server_port }}/v1/chat/completions"
+            method: POST
+            use_proxy: false
+            body_format: json
+            body:
+              model: "{{ model_serve_path }}"
+              messages: [{ role: user, content: "Reply with: pong" }]
+              max_tokens: 16
+            timeout: 300
+          register: smoke
+
+        - name: Result
+          ansible.builtin.debug:
+            msg:
+              endpoint: "http://{{ ansible_host }}:{{ server_port }}/v1"
+              model_path: "{{ model_serve_path }}"
+              size_mb: "{{ model_mb.stdout }}"
+              reply: "{{ smoke.json.choices[0].message.content | default('n/a') | trim }}"
+              usage: "{{ smoke.json.usage | default({}) }}"
+              log: "{{ log_file }}"

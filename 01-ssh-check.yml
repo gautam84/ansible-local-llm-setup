@@ -1,0 +1,98 @@
+---
+# Read-only. Probes every node and writes reports/ssh-check.csv on the controller.
+- name: Hydra | SSH + readiness check
+  hosts: "{{ target | default('hydra') }}"
+  gather_facts: false
+
+  tasks:
+    - name: Raw SSH probe (works even without Python)
+      ansible.builtin.raw: >-
+        echo "macos=$(sw_vers -productVersion)";
+        echo "arch=$(uname -m)";
+        echo "hostname=$(hostname)";
+        xcode-select -p >/dev/null 2>&1 && echo "py=$(/usr/bin/python3 -V 2>&1 | awk '{print $2}')" || echo "py=missing"
+      register: probe
+      changed_when: false
+
+    - name: Parse probe
+      ansible.builtin.set_fact:
+        p_macos: "{{ probe.stdout | regex_search('macos=(\\S+)', '\\1') | first | default('-') }}"
+        p_arch: "{{ probe.stdout | regex_search('arch=(\\S+)', '\\1') | first | default('-') }}"
+        p_hostname: "{{ probe.stdout | regex_search('hostname=(\\S+)', '\\1') | first | default('-') }}"
+        p_py: "{{ probe.stdout | regex_search('py=(\\S+)', '\\1') | first | default('missing') }}"
+
+    - name: Python-backed checks
+      when: p_py != 'missing'
+      block:
+        - name: Ansible ping
+          ansible.builtin.ping:
+
+        - name: Hardware facts (RAM)
+          ansible.builtin.setup:
+            gather_subset: [hardware]
+
+        - name: mlx / mlx-lm in Hydra venv
+          ansible.builtin.command: >-
+            {{ hydra_venv }}/bin/python -c
+            "import mlx.core as mx, mlx_lm; print(mx.__version__ + '/' + mlx_lm.__version__)"
+          register: mlx_ver
+          changed_when: false
+          failed_when: false
+
+        - name: Free disk on home volume (GB)
+          ansible.builtin.shell: df -g "$HOME" | awk 'NR==2{print $4}'
+          register: disk_free
+          changed_when: false
+          failed_when: false
+
+        - name: Egress to Kaggle API via proxy
+          ansible.builtin.command: curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://www.kaggle.com/api/v1/models/list
+          environment: "{{ proxy_env }}"
+          register: kaggle_http
+          changed_when: false
+          failed_when: false
+
+        - name: Egress to GCS (Kaggle download redirect target)
+          ansible.builtin.command: curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://storage.googleapis.com
+          environment: "{{ proxy_env }}"
+          register: gcs_http
+          changed_when: false
+          failed_when: false
+
+    - name: Build report row
+      ansible.builtin.set_fact:
+        check_row:
+          hostname: "{{ p_hostname }}"
+          macos: "{{ p_macos }}"
+          arch: "{{ p_arch }}"
+          python: "{{ p_py }}"
+          mlx: "{{ (mlx_ver.rc | default(1) == 0) | ternary(mlx_ver.stdout | default(''), 'MISSING') }}"
+          mem_gb: "{{ ((ansible_memtotal_mb | default(0)) / 1024) | round(0) | int }}"
+          disk_free_gb: "{{ disk_free.stdout | default('-') }}"
+          kaggle: "{{ kaggle_http.stdout | default('-') or 'ERR' }}"
+          gcs: "{{ gcs_http.stdout | default('-') or 'ERR' }}"
+
+    - name: Write CSV report on controller
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/reports/ssh-check.csv"
+        mode: "0644"
+        content: |
+          inv_host,ip,ssh,hostname,macos,arch,python,mlx/mlx_lm,mem_gb,disk_free_gb,kaggle_http,gcs_http
+          {% for h in ansible_play_hosts_all %}
+          {% set r = hostvars[h].check_row | default(none) %}
+          {% if r %}
+          {{ h }},{{ hostvars[h].ansible_host | default(h) }},ok,{{ r.hostname }},{{ r.macos }},{{ r.arch }},{{ r.python }},{{ r.mlx }},{{ r.mem_gb }},{{ r.disk_free_gb }},{{ r.kaggle }},{{ r.gcs }}
+          {% else %}
+          {{ h }},{{ hostvars[h].ansible_host | default(h) }},UNREACHABLE,,,,,,,,,
+          {% endif %}
+          {% endfor %}
+
+    - name: Summary
+      run_once: true
+      ansible.builtin.debug:
+        msg: >-
+          reachable={{ ansible_play_hosts | length }}/{{ ansible_play_hosts_all | length }}
+          unreachable={{ ansible_play_hosts_all | difference(ansible_play_hosts) }}
+          report={{ playbook_dir }}/reports/ssh-check.csv

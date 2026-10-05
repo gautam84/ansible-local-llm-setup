@@ -1,0 +1,9 @@
+---
+# Copy the handle from the Kaggle model page (kagglehub snippet) + version number:
+#   iamhellodk/<model-slug>/<framework>/<variation>/<version>
+kaggle_model_handle: "iamhellodk/<gemma-4b-slug>/<framework>/<variation>/<version>"   # CHANGE
+model_name: "gemma-4b"
+model_quantize: false        # assume already MLX-quantized on Kaggle; flip if it's raw HF weights
+server_module: "mlx_vlm.server"
+server_port: 8080
+model_serve: true

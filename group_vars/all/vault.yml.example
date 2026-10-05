@@ -1,0 +1,5 @@
+---
+# cp vault.yml.example vault.yml && ansible-vault encrypt vault.yml
+vault_ansible_password: "changeme"
+vault_kaggle_username: "your_kaggle_username"
+vault_kaggle_key: "your_kaggle_api_key"      # kaggle.com > Settings > API > Create New Token

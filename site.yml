@@ -1,0 +1,4 @@
+---
+- import_playbook: 01-ssh-check.yml
+- import_playbook: 02-deploy-model.yml
+- import_playbook: 04-ssh-mesh.yml

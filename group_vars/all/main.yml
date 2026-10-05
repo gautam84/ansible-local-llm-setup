@@ -1,0 +1,44 @@
+---
+# --- Connection (password auth; needs `sshpass` on the controller) ---
+ansible_password: "{{ vault_ansible_password }}"
+ansible_python_interpreter: /usr/bin/python3
+
+# --- Paths (no admin needed — everything under the user's home) ---
+hydra_root: "/Users/{{ ansible_user }}/hydra"
+hydra_venv: "{{ hydra_root }}/venv"          # created by the earlier uv/Py3.12 setup playbook
+hydra_models_dir: "{{ hydra_root }}/models"
+hydra_logs_dir: "{{ hydra_root }}/logs"
+hydra_run_dir: "{{ hydra_root }}/run"
+
+# --- Corporate proxy / Zscaler ---
+proxy_url: "http://proxy.corp.local:8080"     # CHANGE
+zscaler_ca_bundle: ""                          # e.g. /Users/hydra/certs/zscaler.pem ; "" = system trust
+proxy_env:
+  http_proxy: "{{ proxy_url }}"
+  https_proxy: "{{ proxy_url }}"
+  HTTP_PROXY: "{{ proxy_url }}"
+  HTTPS_PROXY: "{{ proxy_url }}"
+  no_proxy: "localhost,127.0.0.1,10.0.0.0/8,.corp.local"
+  NO_PROXY: "localhost,127.0.0.1,10.0.0.0/8,.corp.local"
+
+# --- Kaggle ---
+kaggle_username: "{{ vault_kaggle_username }}"
+kaggle_key: "{{ vault_kaggle_key }}"
+kaggle_download_throttle: 4                    # max nodes pulling at once through the proxy
+
+# --- Model (override per tier in group_vars/<tier>.yml or per host) ---
+# Format: <owner>/<model>/<framework>/<variation>/<version>  (copy from the Kaggle model page)
+kaggle_model_handle: "<owner>/<model>/<framework>/<variation>/<version>"
+model_name: "CHANGE-ME"                        # local dir name under ~/hydra/models
+model_quantize: false                          # true = mlx_lm.convert -q after download
+model_q_bits: 4
+allow_oversize_model: false                    # bypass the "fits in 75% of RAM" guard
+model_serve: true                              # false = download only (e.g. ring-served 27B)
+
+# --- Server ---
+server_module: "mlx_lm.server"                 # mlx_vlm.server for Gemma multimodal
+server_host: "0.0.0.0"                         # reachable by LiteLLM
+server_port: 8080
+server_extra_args: ""
+server_ready_retries: 60                       # x delay = max load wait (10 min)
+server_ready_delay: 10
